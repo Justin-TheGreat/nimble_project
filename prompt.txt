@@ -1,0 +1,12 @@
+I want to create a project that generate fake data into postgresql database, and then stream the data through kafka by creating triggers to postgres tables to take care of CDC, then spark streaming to minio target tables. 
+Please generate scripts that fulfills below requirements:
+1. generate a dockerfile that install ubuntu 22.04 and python with needed libraries.
+2. generate a docker compose file with Kafka, spark streaming, postgres, and minio.
+3. When initialize the postgres database, a script should create 2 tables. the first one with name, robot, DDL is UUID (string), Robot_ID (string), Timestamp (timestamp), Event_ID (string). the second table is teleop, with DDL UUID (string), Robot_ID (string), Timestamp (timestamp), Event_ID (string), Teleoperator_ID (string).
+4. generate script to generate minio tables with the same name and DDL in delta format implement index or partition on .
+5. create triggers in postgres that send data to Kafka.
+6. create spark streaming scripts to subscribe to the kafka topic and then insert data to minio tables.
+7. create another pipeline that send kafka's cpu, memory, disk IO information to another minio table in delta format.
+8. implement data QA checks to compare source postgres vs destination delta table by comparing row count and partial table checksum.
+
+This project should be able to run on any computer with docker installed.

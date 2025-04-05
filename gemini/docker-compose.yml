@@ -1,0 +1,306 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:14
+    container_name: postgres_db
+    environment:
+      POSTGRES_DB: robot_data
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Mount init script - executed only on first creation
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d robot_data"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - data_pipeline_net
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - data_pipeline_net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    container_name: kafka_broker
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      # Port for internal communication within Docker network
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      # Listen on 9092 for external connections (from host), 29092 for internal (other containers)
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    networks:
+      - data_pipeline_net
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio_storage
+    ports:
+      - "9000:9000" # API port
+      - "9001:9001" # Console port
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - data_pipeline_net
+
+  mc: # MinIO Client - used to create buckets initially
+    image: minio/mc
+    container_name: minio_client
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc config host add myminio http://minio:9000 minioadmin minioadmin) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb myminio/delta-lake --ignore-existing;
+      exit 0;
+      "
+    networks:
+      - data_pipeline_net
+
+  # Python base service build context
+  python-base:
+    build:
+      context: .
+      dockerfile: Dockerfile # Assumes Dockerfile is in the same directory
+    image: python-data-pipeline:latest # Tag the image for reuse
+
+  cdc-listener:
+    image: python-data-pipeline:latest # Reuse the image built by python-base
+    container_name: cdc_listener
+    depends_on:
+      postgres:
+        condition: service_healthy # Wait for postgres to be ready
+      kafka:
+        condition: service_started # Kafka doesn't have a simple healthcheck
+    command: python3 cdc_listener.py
+    volumes:
+      - ./cdc_listener.py:/app/cdc_listener.py
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: robot_data
+      PG_USER: user
+      PG_PASSWORD: password
+      KAFKA_BROKER: kafka:29092 # Internal Kafka address
+    networks:
+      - data_pipeline_net
+    restart: on-failure
+
+  data-generator:
+    image: python-data-pipeline:latest
+    container_name: data_generator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: python3 data_generator.py
+    volumes:
+      - ./data_generator.py:/app/data_generator.py
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: robot_data
+      PG_USER: user
+      PG_PASSWORD: password
+      GENERATE_INTERVAL_SECONDS: 5 # Generate data every 5 seconds
+    networks:
+      - data_pipeline_net
+    restart: on-failure
+
+  spark-master:
+    image: bitnami/spark:3.4 # Use a Spark image with Java pre-installed
+    container_name: spark_master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - '8080:8080' # Spark UI
+      - '7077:7077' # Spark Master port
+    networks:
+      - data_pipeline_net
+
+  spark-worker:
+    image: bitnami/spark:3.4
+    container_name: spark_worker
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_WORKER_CORES=1
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    networks:
+      - data_pipeline_net
+
+  spark-app:
+    image: bitnami/spark:3.4 # Use the same Spark image
+    container_name: spark_app
+    depends_on:
+      - spark-master
+      - kafka
+      - minio
+      - cdc-listener # Ensure listener is up before starting Spark
+    volumes:
+      - ./spark_stream_app.py:/app/spark_stream_app.py
+    environment:
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - KAFKA_BROKER=kafka:29092
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - DELTA_LAKE_BUCKET=delta-lake # Bucket created by 'mc' service
+    # Command to submit the PySpark application
+    # Note: Adjust packages based on the Spark image used. Bitnami might need different coordinates.
+    # These packages are for Apache Spark distribution. Check Bitnami image docs if needed.
+    command: >
+      /opt/bitnami/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.1,io.delta:delta-core_2.12:2.4.0,org.apache.hadoop:hadoop-aws:3.3.4
+      --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+      --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      --conf spark.hadoop.fs.s3a.endpoint=${MINIO_ENDPOINT}
+      --conf spark.hadoop.fs.s3a.access.key=${MINIO_ACCESS_KEY}
+      --conf spark.hadoop.fs.s3a.secret.key=${MINIO_SECRET_KEY}
+      --conf spark.hadoop.fs.s3a.path.style.access=true # Crucial for MinIO
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      /app/spark_stream_app.py
+    networks:
+      - data_pipeline_net
+    restart: on-failure
+
+  kafka-monitor-sim:
+    image: python-data-pipeline:latest
+    container_name: kafka_monitor_sim
+    depends_on:
+      - kafka
+    command: python3 kafka_monitor_sim.py
+    volumes:
+      - ./kafka_monitor_sim.py:/app/kafka_monitor_sim.py
+    environment:
+      KAFKA_BROKER: kafka:29092
+      MONITOR_INTERVAL_SECONDS: 15 # Send metrics every 15 seconds
+    networks:
+      - data_pipeline_net
+    restart: on-failure
+
+  spark-monitor-app:
+    image: bitnami/spark:3.4
+    container_name: spark_monitor_app
+    depends_on:
+      - spark-master
+      - kafka
+      - minio
+      - kafka-monitor-sim # Ensure simulator is running
+    volumes:
+      - ./spark_monitor_app.py:/app/spark_monitor_app.py
+    environment:
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - KAFKA_BROKER=kafka:29092
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - DELTA_LAKE_BUCKET=delta-lake
+    command: >
+      /opt/bitnami/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.1,io.delta:delta-core_2.12:2.4.0,org.apache.hadoop:hadoop-aws:3.3.4
+      --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+      --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      --conf spark.hadoop.fs.s3a.endpoint=${MINIO_ENDPOINT}
+      --conf spark.hadoop.fs.s3a.access.key=${MINIO_ACCESS_KEY}
+      --conf spark.hadoop.fs.s3a.secret.key=${MINIO_SECRET_KEY}
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      /app/spark_monitor_app.py
+    networks:
+      - data_pipeline_net
+    restart: on-failure
+
+  qa-checker:
+    image: python-data-pipeline:latest # Reuse python image OR use spark image if SparkSession needed directly
+    container_name: qa_checker
+    depends_on:
+       # Depends on everything being potentially up, but doesn't need to run constantly
+       - postgres
+       - minio
+       - spark-app # Wait for the main app to potentially write data
+    command: >
+      /bin/sh -c "
+      echo 'Waiting for initial data flow before running QA...' && sleep 60;
+      python3 qa_checker.py;
+      echo 'QA check finished. Exiting QA container.'
+      "
+    volumes:
+      - ./qa_checker.py:/app/qa_checker.py
+      # We might need Spark config here too if running Spark locally inside this container
+      # Or configure it to connect to the cluster master if needed.
+      # For simplicity, this script might connect directly to Postgres and MinIO (using boto3 maybe)
+      # OR use a local SparkSession configured for MinIO. Let's assume local SparkSession for Delta reading.
+      # Mount Spark config if needed, or rely on environment variables.
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: robot_data
+      PG_USER: user
+      PG_PASSWORD: password
+      MINIO_ENDPOINT: http://minio:9000 # Needs http:// prefix for Spark/boto3
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      DELTA_LAKE_BUCKET: delta-lake
+      # Spark config for local session within QA container
+      PYSPARK_SUBMIT_ARGS: >-
+        --packages io.delta:delta-core_2.12:2.4.0,org.apache.hadoop:hadoop-aws:3.3.4
+        --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+        --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+        --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+        --conf spark.hadoop.fs.s3a.access.key=minioadmin
+        --conf spark.hadoop.fs.s3a.secret.key=minioadmin
+        --conf spark.hadoop.fs.s3a.path.style.access=true
+        --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+        pyspark-shell
+    networks:
+      - data_pipeline_net
+    # This service runs once and exits after the check.
+
+volumes:
+  postgres_data:
+  minio_data:
+
+networks:
+  data_pipeline_net:
+    driver: bridge
+

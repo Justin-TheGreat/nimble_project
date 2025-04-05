@@ -1,0 +1,23 @@
+# Data processing
+pandas==2.1.0
+numpy==1.26.0
+faker==19.6.2
+psycopg2-binary==2.9.7
+sqlalchemy==2.0.21
+pyspark==3.5.0
+delta-spark==2.4.0
+
+# Kafka
+confluent-kafka==2.2.0
+kafka-python==2.0.2
+
+# Minio
+minio==7.1.16
+
+# Monitoring
+prometheus-client==0.17.1
+psutil==5.9.5
+
+# Testing and validation
+pytest==7.4.2
+great-expectations==0.17.15
